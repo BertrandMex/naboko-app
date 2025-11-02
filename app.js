@@ -87,27 +87,70 @@
     }
   }
 
-  // --------- 4. High-throughput handleDecodedArray
+  // --------- 4. PATCH A: Normalizing, logging and robust handleDecodedArray
   async function handleDecodedArray(decodedArray) {
-    // decodedArray: array of decodedText strings (may contain duplicates)
     const now = Date.now();
 
-    // Build ordered unique list preserving first occurrence
+    // normalization helper: trim, remove BOM and control chars, try decodeURIComponent
+    function normalizeId(raw) {
+      if (raw === undefined || raw === null) raw = '';
+      let s = String(raw);
+
+      // visible representation for logs: show BOM and control chars clearly
+      const visible = s
+        .replace(/\uFEFF/g, '[BOM]')
+        .replace(/\r/g, '[0x0d]')
+        .replace(/\n/g, '[0x0a]')
+        .replace(/\t/g, '[0x09]');
+
+      // Normalize: trim and strip BOM
+      s = s.trim().replace(/^\uFEFF/, '').replace(/\uFEFF$/, '');
+
+      // try decodeURIComponent safely (catch malformed sequences)
+      try {
+        const dec = decodeURIComponent(s);
+        if (dec && dec.length < 200) s = dec;
+      } catch (e) {
+        // ignore decode errors
+      }
+
+      // remove remaining non-printable except space
+      s = s.replace(/[\x00-\x1F\x7F]/g, '');
+
+      return { raw: raw, visible, key: s };
+    }
+
+    // Build ordered unique list preserving first occurrence after normalization
     const seen = new Set();
     const uniqueOrdered = [];
     for (const raw of decodedArray) {
-      const id = (raw || '').trim();
-      if (!id) continue;
-      if (seen.has(id)) continue;
-      seen.add(id);
-      uniqueOrdered.push(id);
+      const { key, visible } = normalizeId(raw);
+      console.log('decoded raw:', raw, 'visible:', visible, 'normalized:', key);
+      if (!key) continue;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      uniqueOrdered.push(key);
     }
 
-    // Filter by mapping and debounce timestamp
+    // Filter by mapping and debounce timestamp, with case-insensitive fallback for debugging
     const playableMetas = [];
     for (const id of uniqueOrdered) {
       const meta = figuresMap[id];
-      if (!meta) continue;
+      if (!meta) {
+        console.warn('No mapping for decoded id (phone may differ):', id);
+        // Try case-insensitive match as helpful fallback
+        const lowered = Object.keys(figuresMap).find(k => k.toLowerCase() === id.toLowerCase());
+        if (lowered) {
+          console.warn('Found case-insensitive match, using', lowered);
+          const mf = figuresMap[lowered];
+          const lastAlt = lastPlayed[lowered] || 0;
+          if (now - lastAlt >= DEBOUNCE_MS) {
+            lastPlayed[lowered] = now;
+            playableMetas.push(mf);
+          }
+        }
+        continue;
+      }
       const last = lastPlayed[id] || 0;
       if (now - last < DEBOUNCE_MS) continue;
       lastPlayed[id] = now;
@@ -117,7 +160,7 @@
     if (playableMetas.length === 0) return;
 
     const toPlay = playableMetas.slice(0, MAX_SIMULTANEOUS_VOICES);
-    console.log('To play', toPlay.map(p => ({ id: p.id, sound: p.sound })));
+    console.log('To play (after normalization):', toPlay.map(p => ({ id: p.id, sound: p.sound })));
 
     // Ensure buffers are loaded (parallel)
     await Promise.all(toPlay.map(async m => {
@@ -126,7 +169,7 @@
           await loadAudio(m.sound);
           console.log('Loaded audio for', m.sound);
         } catch (e) {
-          console.warn('Failed to load audio', m.sound, e);
+          console.error('Failed to load audio for', m.sound, e);
         }
       }
     }));
