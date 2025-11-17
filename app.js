@@ -9,10 +9,10 @@
   // --------- Configurable constants (tuned for throughput)
   const AUDIO_CTX = new (window.AudioContext || window.webkitAudioContext)();
   let DEBOUNCE_MS = 250;                   // lower debounce for faster repeats
-  let MAX_SIMULTANEOUS_VOICES = 15;        // increased for iPhone 12
-  const QR_CONFIG = { fps: 30, qrbox: 180, aspectRatio: 1.777 }; // optimized for iPhone 12
-  const FRAME_WINDOW_MS = 30;              // gather decoded frames for 30ms windows
-  const STAGGER_MS = 10;                   // tighter staggering
+  const MAX_SIMULTANEOUS_VOICES = 10;      // allow more concurrent voices
+  const QR_CONFIG = { fps: 20, qrbox: 220 };
+  const FRAME_WINDOW_MS = 50;              // gather decoded frames for 50ms windows
+  const STAGGER_MS = 12;                   // tiny start stagger to avoid CPU spikes
 
   // --------- State
   let figuresMap = {};        // { id: { id, label, role, sound } }
@@ -87,70 +87,27 @@
     }
   }
 
-  // --------- 4. PATCH A: Normalizing, logging and robust handleDecodedArray
+  // --------- 4. High-throughput handleDecodedArray
   async function handleDecodedArray(decodedArray) {
+    // decodedArray: array of decodedText strings (may contain duplicates)
     const now = Date.now();
 
-    // normalization helper: trim, remove BOM and control chars, try decodeURIComponent
-    function normalizeId(raw) {
-      if (raw === undefined || raw === null) raw = '';
-      let s = String(raw);
-
-      // visible representation for logs: show BOM and control chars clearly
-      const visible = s
-        .replace(/\uFEFF/g, '[BOM]')
-        .replace(/\r/g, '[0x0d]')
-        .replace(/\n/g, '[0x0a]')
-        .replace(/\t/g, '[0x09]');
-
-      // Normalize: trim and strip BOM
-      s = s.trim().replace(/^\uFEFF/, '').replace(/\uFEFF$/, '');
-
-      // try decodeURIComponent safely (catch malformed sequences)
-      try {
-        const dec = decodeURIComponent(s);
-        if (dec && dec.length < 200) s = dec;
-      } catch (e) {
-        // ignore decode errors
-      }
-
-      // remove remaining non-printable except space
-      s = s.replace(/[\x00-\x1F\x7F]/g, '');
-
-      return { raw: raw, visible, key: s };
-    }
-
-    // Build ordered unique list preserving first occurrence after normalization
+    // Build ordered unique list preserving first occurrence
     const seen = new Set();
     const uniqueOrdered = [];
     for (const raw of decodedArray) {
-      const { key, visible } = normalizeId(raw);
-      console.log('decoded raw:', raw, 'visible:', visible, 'normalized:', key);
-      if (!key) continue;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      uniqueOrdered.push(key);
+      const id = (raw || '').trim();
+      if (!id) continue;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      uniqueOrdered.push(id);
     }
 
-    // Filter by mapping and debounce timestamp, with case-insensitive fallback for debugging
+    // Filter by mapping and debounce timestamp
     const playableMetas = [];
     for (const id of uniqueOrdered) {
       const meta = figuresMap[id];
-      if (!meta) {
-        console.warn('No mapping for decoded id (phone may differ):', id);
-        // Try case-insensitive match as helpful fallback
-        const lowered = Object.keys(figuresMap).find(k => k.toLowerCase() === id.toLowerCase());
-        if (lowered) {
-          console.warn('Found case-insensitive match, using', lowered);
-          const mf = figuresMap[lowered];
-          const lastAlt = lastPlayed[lowered] || 0;
-          if (now - lastAlt >= DEBOUNCE_MS) {
-            lastPlayed[lowered] = now;
-            playableMetas.push(mf);
-          }
-        }
-        continue;
-      }
+      if (!meta) continue;
       const last = lastPlayed[id] || 0;
       if (now - last < DEBOUNCE_MS) continue;
       lastPlayed[id] = now;
@@ -160,7 +117,7 @@
     if (playableMetas.length === 0) return;
 
     const toPlay = playableMetas.slice(0, MAX_SIMULTANEOUS_VOICES);
-    console.log('To play (after normalization):', toPlay.map(p => ({ id: p.id, sound: p.sound })));
+    console.log('To play', toPlay.map(p => ({ id: p.id, sound: p.sound })));
 
     // Ensure buffers are loaded (parallel)
     await Promise.all(toPlay.map(async m => {
@@ -169,7 +126,7 @@
           await loadAudio(m.sound);
           console.log('Loaded audio for', m.sound);
         } catch (e) {
-          console.error('Failed to load audio for', m.sound, e);
+          console.warn('Failed to load audio', m.sound, e);
         }
       }
     }));
@@ -334,12 +291,12 @@
         // Preload all sounds (best-effort)
         try {
           const urls = Array.from(new Set(Object.values(figuresMap).map(f => f.sound)));
-          const urls = Array.from(new Set(Object.values(figuresMap).map(f => f.sound)));
           console.log('Preloading sounds:', urls);
-          await Promise.allSettled(urls.map(u => loadAudio(u).catch(err => {
-            console.warn('Preload failed for', u, err);
-          })));
+          await Promise.all(urls.map(u => loadAudio(u).catch(err => { console.warn('Preload failed for', u, err); })));
           console.log('Preload complete');
+        } catch (e) {
+          console.warn('Preload error', e);
+        }
 
         startBtn.style.display = 'none';
         await startScanner('user').catch(err => console.error('Scanner start failed', err));
@@ -368,15 +325,8 @@
 
   // Expose tuning controls for runtime debugging (optional)
   window.nabokoTuning = {
-    setDebounce(ms) {
-      DEBOUNCE_MS = Number(ms) || DEBOUNCE_MS;
-      console.log('DEBOUNCE_MS set to', DEBOUNCE_MS);
-    },
-    setMaxVoices(n) {
-      MAX_SIMULTANEOUS_VOICES = Number(n) || MAX_SIMULTANEOUS_VOICES;
-      console.log('MAX_SIMULTANEOUS_VOICES set to', MAX_SIMULTANEOUS_VOICES);
-    },
-    setFrameWindow(ms) {
-      console.warn('Frame window is fixed in code');
-    }
+    setDebounce(ms) { DEBOUNCE_MS = Number(ms) || DEBOUNCE_MS; console.log('DEBOUNCE_MS set to', DEBOUNCE_MS); },
+    setFrameWindow(ms) { /* not dynamic in this build */ console.warn('Frame window is fixed in code'); },
+    setMaxVoices(n) { /* not dynamic */ console.warn('Max voices fixed in code'); }
   };
+})();
