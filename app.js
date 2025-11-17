@@ -330,3 +330,4 @@
     setMaxVoices(n) { /* not dynamic */ console.warn('Max voices fixed in code'); }
   };
 })();
+
